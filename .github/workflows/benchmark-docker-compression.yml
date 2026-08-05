@@ -1,0 +1,279 @@
+name: Benchmark Docker Image Compression (zstd vs gzip)
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_stage:
+        description: 'Dockerfile.cpu stage to build'
+        required: false
+        default: 'base-common'
+        type: choice
+        options:
+          - base-common
+          - vllm-openai
+      pull_iterations:
+        description: 'Number of pull iterations per variant'
+        required: false
+        default: '2'
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: benchmark-compression-${{ github.run_id }}
+  cancel-in-progress: false
+
+env:
+  IMAGE_BASE: ghcr.io/${{ github.repository_owner }}/vllm-compression-bench
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: gzip-default
+            output_flags: "type=image,push=true,compression=gzip,oci-mediatypes=true"
+          - name: zstd-3
+            output_flags: "type=image,push=true,compression=zstd,compression-level=3,force-compression=true,oci-mediatypes=true"
+          - name: zstd-9
+            output_flags: "type=image,push=true,compression=zstd,compression-level=9,force-compression=true,oci-mediatypes=true"
+          - name: zstd-15
+            output_flags: "type=image,push=true,compression=zstd,compression-level=15,force-compression=true,oci-mediatypes=true"
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache /usr/local/share/boost
+          sudo docker system prune -af
+          df -h /
+
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        id: build
+        run: |
+          IMAGE_TAG="${IMAGE_BASE}:${{ matrix.name }}-${GITHUB_RUN_ID}"
+          echo "image_tag=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+
+          START=$(date +%s%N)
+          docker buildx build \
+            --file docker/Dockerfile.cpu \
+            --target "${{ inputs.target_stage || 'base-common' }}" \
+            --build-arg max_jobs=2 \
+            --no-cache \
+            --output "${{ matrix.output_flags }}" \
+            --tag "${IMAGE_TAG}" \
+            --progress plain \
+            .
+          END=$(date +%s%N)
+
+          BUILD_MS=$(( (END - START) / 1000000 ))
+          echo "build_ms=${BUILD_MS}" >> "$GITHUB_OUTPUT"
+
+      - name: Measure compressed size with crane
+        id: size
+        run: |
+          CRANE_VERSION=0.20.3
+          curl -sL "https://github.com/google/go-containerregistry/releases/download/v${CRANE_VERSION}/go-containerregistry_Linux_x86_64.tar.gz" \
+            | tar -xzf - crane
+          chmod +x crane
+
+          IMAGE_TAG="${{ steps.build.outputs.image_tag }}"
+          COMPRESSED_BYTES=$(./crane manifest "${IMAGE_TAG}" | jq '[.layers[].size] | add')
+          LAYER_COUNT=$(./crane manifest "${IMAGE_TAG}" | jq '.layers | length')
+
+          echo "compressed_bytes=${COMPRESSED_BYTES}" >> "$GITHUB_OUTPUT"
+          echo "layer_count=${LAYER_COUNT}" >> "$GITHUB_OUTPUT"
+
+      - name: Write metrics
+        run: |
+          mkdir -p metrics
+          jq -n \
+            --arg name "${{ matrix.name }}" \
+            --arg tag "${{ steps.build.outputs.image_tag }}" \
+            --argjson build_ms "${{ steps.build.outputs.build_ms }}" \
+            --argjson compressed_bytes "${{ steps.size.outputs.compressed_bytes }}" \
+            --argjson layer_count "${{ steps.size.outputs.layer_count }}" \
+            '{name: $name, tag: $tag, build_ms: $build_ms, compressed_bytes: $compressed_bytes, layer_count: $layer_count}' \
+            > "metrics/build-${{ matrix.name }}.json"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: build-metrics-${{ matrix.name }}
+          path: metrics/
+
+  measure-pull:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: gzip-default
+          - name: zstd-3
+          - name: zstd-9
+          - name: zstd-15
+    steps:
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Measure cold pull time
+        id: pull
+        run: |
+          IMAGE_TAG="${IMAGE_BASE}:${{ matrix.name }}-${GITHUB_RUN_ID}"
+          ITERATIONS=${{ inputs.pull_iterations || '2' }}
+
+          for i in $(seq 1 "${ITERATIONS}"); do
+            docker system prune -af --volumes >/dev/null 2>&1
+            sync
+            echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null 2>&1 || true
+
+            START=$(date +%s%N)
+            docker pull "${IMAGE_TAG}"
+            END=$(date +%s%N)
+
+            PULL_MS=$(( (END - START) / 1000000 ))
+            echo "${PULL_MS}" >> pull_times.txt
+            echo "Iteration ${i}: ${PULL_MS} ms"
+          done
+
+          MEDIAN_MS=$(sort -n pull_times.txt | awk '{a[NR]=$1} END{print a[int((NR+1)/2)]}')
+          echo "median_pull_ms=${MEDIAN_MS}" >> "$GITHUB_OUTPUT"
+
+      - name: Write pull metrics
+        run: |
+          mkdir -p metrics
+          jq -n \
+            --arg name "${{ matrix.name }}" \
+            --argjson median_pull_ms "${{ steps.pull.outputs.median_pull_ms }}" \
+            '{name: $name, median_pull_ms: $median_pull_ms}' \
+            > "metrics/pull-${{ matrix.name }}.json"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: pull-metrics-${{ matrix.name }}
+          path: metrics/
+
+  summarize:
+    needs: measure-pull
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: "*-metrics-*"
+          merge-multiple: true
+          path: metrics/
+
+      - name: Generate comparison table
+        run: |
+          # Merge build and pull metrics per variant
+          for name in gzip-default zstd-3 zstd-9 zstd-15; do
+            jq -s '.[0] * .[1]' \
+              "metrics/build-${name}.json" \
+              "metrics/pull-${name}.json" \
+              > "metrics/combined-${name}.json"
+          done
+
+          # Get gzip baseline values for delta computation
+          GZIP_BYTES=$(jq '.compressed_bytes' metrics/combined-gzip-default.json)
+          GZIP_PULL=$(jq '.median_pull_ms' metrics/combined-gzip-default.json)
+          GZIP_BUILD=$(jq '.build_ms' metrics/combined-gzip-default.json)
+
+          {
+            echo "## Docker Compression Benchmark Results"
+            echo ""
+            echo "**Target stage**: \`${{ inputs.target_stage || 'base-common' }}\` from \`docker/Dockerfile.cpu\`"
+            echo "**Pull iterations**: ${{ inputs.pull_iterations || '2' }}"
+            echo ""
+            echo "| Variant | Build Time | Compressed Size | Size vs gzip | Pull Time (median) | Pull vs gzip |"
+            echo "|---------|-----------|----------------|-------------|-------------------|-------------|"
+
+            for name in gzip-default zstd-3 zstd-9 zstd-15; do
+              BUILD_MS=$(jq '.build_ms' "metrics/combined-${name}.json")
+              BYTES=$(jq '.compressed_bytes' "metrics/combined-${name}.json")
+              PULL_MS=$(jq '.median_pull_ms' "metrics/combined-${name}.json")
+              LAYERS=$(jq '.layer_count' "metrics/combined-${name}.json")
+
+              # Format build time as Xm Ys
+              BUILD_MIN=$((BUILD_MS / 60000))
+              BUILD_SEC=$(( (BUILD_MS % 60000) / 1000))
+              BUILD_FMT="${BUILD_MIN}m ${BUILD_SEC}s"
+
+              # Format size in MB
+              SIZE_MB=$(awk "BEGIN {printf \"%.1f\", ${BYTES} / 1048576}")
+
+              # Format pull time in seconds
+              PULL_SEC=$(awk "BEGIN {printf \"%.1f\", ${PULL_MS} / 1000}")
+
+              if [ "${name}" = "gzip-default" ]; then
+                SIZE_DELTA="baseline"
+                PULL_DELTA="baseline"
+              else
+                SIZE_DELTA=$(awk "BEGIN {printf \"%+.1f%%\", (${BYTES} - ${GZIP_BYTES}) / ${GZIP_BYTES} * 100}")
+                PULL_DELTA=$(awk "BEGIN {printf \"%+.1f%%\", (${PULL_MS} - ${GZIP_PULL}) / ${GZIP_PULL} * 100}")
+              fi
+
+              echo "| ${name} | ${BUILD_FMT} | ${SIZE_MB} MB (${LAYERS} layers) | ${SIZE_DELTA} | ${PULL_SEC}s | ${PULL_DELTA} |"
+            done
+            # Consolidated JSON report
+            jq -s '.' metrics/combined-*.json > metrics/report.json
+
+            echo ""
+            echo "### Raw data"
+            echo '```json'
+            cat metrics/report.json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: compression-benchmark-report
+          path: metrics/report.json
+
+  cleanup:
+    needs: summarize
+    runs-on: ubuntu-latest
+    if: always()
+    timeout-minutes: 10
+    permissions:
+      packages: write
+    steps:
+      - name: Delete benchmark images from ghcr.io
+        continue-on-error: true
+        run: |
+          for name in gzip-default zstd-3 zstd-9 zstd-15; do
+            TAG="${name}-${GITHUB_RUN_ID}"
+            echo "Deleting ${IMAGE_BASE}:${TAG}"
+            # ghcr.io package version deletion via API
+            PACKAGE_NAME="vllm-compression-bench"
+            VERSION_ID=$(curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/user/packages/container/${PACKAGE_NAME}/versions" \
+              | jq -r ".[] | select(.metadata.container.tags[] == \"${TAG}\") | .id" 2>/dev/null || echo "")
+            if [ -n "${VERSION_ID}" ] && [ "${VERSION_ID}" != "null" ]; then
+              curl -s -X DELETE -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+                -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/user/packages/container/${PACKAGE_NAME}/versions/${VERSION_ID}"
+              echo "Deleted version ${VERSION_ID}"
+            else
+              echo "Could not find version for tag ${TAG}, skipping"
+            fi
+          done
